@@ -1,28 +1,40 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Package tcpretrans contains the Retina tcpretrans plugin. It utilizes inspektor-gadget to trace TCP retransmissions.
+// Package tcpretrans contains the Retina tcpretrans plugin. It utilizes eBPF to trace TCP retransmissions.
 package tcpretrans
 
 import (
 	"context"
-	"fmt"
 	"net"
-	"strings"
+	"unsafe"
 
 	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
-	gadgetcontext "github.com/inspektor-gadget/inspektor-gadget/pkg/gadget-context"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets/trace/tcpretrans/tracer"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/gadgets/trace/tcpretrans/types"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/socketenricher"
-	"github.com/inspektor-gadget/inspektor-gadget/pkg/utils/host"
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/perf"
+	"github.com/microsoft/retina/internal/ktime"
 	kcfg "github.com/microsoft/retina/pkg/config"
 	"github.com/microsoft/retina/pkg/enricher"
 	"github.com/microsoft/retina/pkg/log"
+	"github.com/microsoft/retina/pkg/metrics"
+	plugincommon "github.com/microsoft/retina/pkg/plugin/common"
 	"github.com/microsoft/retina/pkg/plugin/registry"
 	"github.com/microsoft/retina/pkg/utils"
+	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
+)
+
+// Per-arch target needed because vmlinux.h differs between amd64/arm64.
+// Cross-generate: GOARCH=arm64 go generate ./pkg/plugin/tcpretrans/...
+//
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go@master -cflags "-Wall" -target ${GOARCH} -type tcpretrans_event tcpretrans ./_cprog/tcpretrans.c -- -I../lib/_${GOARCH} -I../lib/common/libbpf/_src
+
+const (
+	perCPUBuffer  = 4096 // Per-CPU buffer pages for perf reader
+	recordsBuffer = 500  // Channel buffer for records
+	workers       = 2    // Number of worker goroutines
 )
 
 func init() {
@@ -40,33 +52,42 @@ func (t *tcpretrans) Name() string {
 	return name
 }
 
-func (t *tcpretrans) Generate(ctx context.Context) error {
-	return nil
-}
-
-func (t *tcpretrans) Compile(ctx context.Context) error {
-	return nil
-}
+// Generate and Compile are no-ops. The plugin manager lifecycle requires them,
+// but tcpretrans uses bpf2go which pre-compiles the BPF program at build time
+// and embeds it in the binary — no runtime code generation or compilation needed.
+func (t *tcpretrans) Generate(_ context.Context) error { return nil }
+func (t *tcpretrans) Compile(_ context.Context) error  { return nil }
 
 func (t *tcpretrans) Init() error {
 	if !t.cfg.EnablePodLevel {
 		t.l.Warn("tcpretrans will not init because pod level is disabled")
 		return nil
 	}
-	// Create tracer. In this case no parameters are passed.
-	if err := host.Init(host.Config{}); err != nil {
-		t.l.Error("failed to init host", zap.Error(err))
-		return fmt.Errorf("failed to init host: %w", err)
+
+	objs := &tcpretransObjects{}
+	if err := loadTcpretransObjects(objs, &ebpf.CollectionOptions{
+		Maps: ebpf.MapOptions{
+			PinPath: plugincommon.MapPath,
+		},
+	}); err != nil {
+		return errors.Wrap(err, "failed to load eBPF objects")
 	}
-	t.tracer = &tracer.Tracer{}
-	t.tracer.SetEventHandler(t.eventHandler)
-	socketEnricher, err := socketenricher.NewSocketEnricher()
+	t.objs = objs
+
+	// Attach to the tcp/tcp_retransmit_skb tracepoint (stable API, kernel 4.16+)
+	tp, err := link.Tracepoint("tcp", "tcp_retransmit_skb", objs.RetinaTcpRetransmitSkb, nil)
 	if err != nil {
-		t.l.Error("failed to new socketEnricher", zap.Error(err))
-		return fmt.Errorf("failed to new socketEnricher: %w", err)
+		return errors.Wrap(err, "failed to attach tracepoint tcp/tcp_retransmit_skb")
 	}
-	t.tracer.SetSocketEnricherMap(socketEnricher.SocketsMap())
-	t.l.Info("Initialized tcpretrans plugin")
+	t.hooks = append(t.hooks, tp)
+
+	reader, err := plugincommon.NewPerfReader(t.l, objs.RetinaTcpretransEvents, perCPUBuffer, 1)
+	if err != nil {
+		return errors.Wrap(err, "failed to create perf reader")
+	}
+	t.reader = reader
+
+	t.l.Info("tcpretrans plugin initialized")
 	return nil
 }
 
@@ -75,108 +96,162 @@ func (t *tcpretrans) Start(ctx context.Context) error {
 		t.l.Warn("tcpretrans will not start because pod level is disabled")
 		return nil
 	}
-	// Set up enricher
+
+	t.isRunning = true
+
 	if enricher.IsInitialized() {
 		t.enricher = enricher.Instance()
 	} else {
-		t.l.Error(errEnricherNotInitialized.Error())
-		return errEnricherNotInitialized
+		t.l.Warn("retina enricher is not initialized")
 	}
-	t.gadgetCtx = gadgetcontext.New(ctx, "tcpretrans", nil, nil, nil, nil, nil, nil, nil, nil, 0, nil)
 
-	err := t.tracer.Run(t.gadgetCtx)
-	if err != nil {
-		t.l.Error("Failed to run tracer", zap.Error(err))
-		return err
+	t.recordsChannel = make(chan perf.Record, recordsBuffer)
+
+	return t.run(ctx)
+}
+
+func (t *tcpretrans) run(ctx context.Context) error {
+	for i := range workers {
+		t.wg.Add(1)
+		go t.processRecord(ctx, i)
 	}
-	t.l.Info("Started tcpretrans plugin")
+	go t.readEvents(ctx)
+
+	<-ctx.Done()
+	t.wg.Wait()
 	return nil
 }
 
+func (t *tcpretrans) readEvents(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			record, err := t.reader.Read()
+			if err != nil {
+				if errors.Is(err, perf.ErrClosed) {
+					return
+				}
+				t.l.Error("Error reading perf event", zap.Error(err))
+				continue
+			}
+
+			if record.LostSamples > 0 {
+				metrics.LostEventsCounter.WithLabelValues(utils.Kernel, name).Add(float64(record.LostSamples))
+				continue
+			}
+
+			select {
+			case t.recordsChannel <- record:
+			default:
+				metrics.LostEventsCounter.WithLabelValues(utils.BufferedChannel, name).Inc()
+			}
+		}
+	}
+}
+
+func (t *tcpretrans) processRecord(ctx context.Context, _ int) {
+	defer t.wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case record := <-t.recordsChannel:
+			t.handleTCPRetransEvent(record)
+		}
+	}
+}
+
+func (t *tcpretrans) handleTCPRetransEvent(record perf.Record) {
+	eventSize := int(unsafe.Sizeof(tcpretransTcpretransEvent{}))
+	if len(record.RawSample) < eventSize {
+		return
+	}
+
+	event := (*tcpretransTcpretransEvent)(unsafe.Pointer(&record.RawSample[0])) //nolint:gosec // perf record is aligned
+
+	var srcIP, dstIP net.IP
+	switch event.Af {
+	case 4: // IPv4
+		var srcBuf, dstBuf [net.IPv4len]byte
+		*(*uint32)(unsafe.Pointer(&srcBuf[0])) = event.SrcIp //nolint:gosec // same size
+		*(*uint32)(unsafe.Pointer(&dstBuf[0])) = event.DstIp //nolint:gosec // same size
+		srcIP = srcBuf[:]
+		dstIP = dstBuf[:]
+	case 6: // IPv6
+		srcIP = event.SrcIp6[:]
+		dstIP = event.DstIp6[:]
+	default:
+		return
+	}
+
+	fl := utils.ToFlow(
+		t.l,
+		ktime.MonotonicOffset.Nanoseconds()+int64(event.Timestamp), //nolint:gosec // timestamp fits in int64
+		srcIP, dstIP,
+		uint32(event.SrcPort), uint32(event.DstPort),
+		unix.IPPROTO_TCP, 0,
+		utils.Verdict_RETRANSMISSION,
+	)
+	if fl == nil {
+		return
+	}
+
+	syn := flagBit(event.Tcpflags, 0x02)
+	ack := flagBit(event.Tcpflags, 0x10)
+	fin := flagBit(event.Tcpflags, 0x01)
+	rst := flagBit(event.Tcpflags, 0x04)
+	psh := flagBit(event.Tcpflags, 0x08)
+	urg := flagBit(event.Tcpflags, 0x20)
+	ece := flagBit(event.Tcpflags, 0x40)
+	cwr := flagBit(event.Tcpflags, 0x80)
+	utils.AddTCPFlags(fl, syn, ack, fin, rst, psh, urg, ece, cwr, 0)
+
+	ev := &v1.Event{
+		Event:     fl,
+		Timestamp: fl.Time,
+	}
+
+	if t.enricher != nil {
+		t.enricher.Write(ev)
+	}
+
+	if t.externalChannel != nil {
+		select {
+		case t.externalChannel <- ev:
+		default:
+			metrics.LostEventsCounter.WithLabelValues(utils.ExternalChannel, name).Inc()
+		}
+	}
+}
+
 func (t *tcpretrans) Stop() error {
-	if !t.cfg.EnablePodLevel {
+	if !t.cfg.EnablePodLevel || !t.isRunning {
 		return nil
 	}
-	if t.gadgetCtx == nil {
-		t.l.Warn("tcpretrans plugin does not have a gadget context")
-		return nil
+	if t.reader != nil {
+		t.reader.Close()
 	}
-	t.gadgetCtx.Cancel()
-	t.l.Info("Stopped tcpretrans plugin")
+	for _, h := range t.hooks {
+		h.Close()
+	}
+	if t.objs != nil {
+		t.objs.Close()
+	}
+	t.isRunning = false
 	return nil
 }
 
 func (t *tcpretrans) SetupChannel(ch chan *v1.Event) error {
-	t.l.Warn("SetupChannel is not supported by plugin", zap.String("plugin", name))
+	t.externalChannel = ch
 	return nil
 }
 
-func (t *tcpretrans) eventHandler(event *types.Event) {
-	if event == nil {
-		return
+func flagBit(flags, bit uint8) uint16 {
+	if flags&bit != 0 {
+		return 1
 	}
-
-	if event.IPVersion != 4 {
-		return
-	}
-
-	// TODO add metric here or add a enriched value
-	fl := utils.ToFlow(
-		t.l,
-		int64(event.Timestamp),
-		net.ParseIP(event.SrcEndpoint.L3Endpoint.Addr).To4(), // Precautionary To4() call.
-		net.ParseIP(event.DstEndpoint.L3Endpoint.Addr).To4(), // Precautionary To4() call.
-		uint32(event.SrcEndpoint.Port),
-		uint32(event.DstEndpoint.Port),
-		unix.IPPROTO_TCP, // only TCP can  have retransmissions
-		0,                // drop reason packet doesn't have a direction yet, so we set it to 0
-		utils.Verdict_RETRANSMISSION,
-	)
-
-	if fl == nil {
-		t.l.Warn("Could not convert tracer Event to flow", zap.Any("tracer event", event))
-		return
-	}
-	syn, ack, fin, rst, psh, urg, ece, cwr, ns := getTCPFlags(event.Tcpflags)
-	utils.AddTCPFlags(fl, syn, ack, fin, rst, psh, urg, ece, cwr, ns)
-
-	// This is only for development purposes.
-	// Removing this makes logs way too chatter-y.
-	// dr.l.Debug("DropReason Packet Received", zap.Any("flow", fl), zap.Any("Raw Bpf Event", bpfEvent), zap.Uint32("drop type", bpfEvent.Key.DropType))
-
-	// Write the event to the enricher.
-	t.enricher.Write(&v1.Event{
-		Event:     fl,
-		Timestamp: fl.Time,
-	})
-}
-
-//nolint:gocritic // This should be rewritten to return a struct.
-func getTCPFlags(flags string) (syn, ack, fin, rst, psh, urg, ece, cwr, ns uint16) {
-	// this limiter is used in IG to put all the flags together
-	syn, ack, fin, rst, psh, urg = 0, 0, 0, 0, 0, 0
-	result := strings.Split(flags, "|")
-	for _, flag := range result {
-		switch flag {
-		case "SYN":
-			syn = 1
-		case "ACK":
-			ack = 1
-		case "FIN":
-			fin = 1
-		case "RST":
-			rst = 1
-		case "PSH":
-			psh = 1
-		case "URG":
-			urg = 1
-		case "ECE":
-			ece = 1
-		case "CWR":
-			cwr = 1
-		case "NS":
-			ns = 1
-		}
-	}
-	return
+	return 0
 }
